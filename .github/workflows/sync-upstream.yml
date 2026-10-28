@@ -1,0 +1,190 @@
+name: Sync upstream safely
+
+on:
+  schedule:
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Check all merges without pushing
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'silasthegoldenwizard/paperclip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FORK_REPOSITORY: ${{ github.repository }}
+      UPSTREAM_REPOSITORY: paperclipai/paperclip
+      EXPECTED_DEFAULT_BRANCH: master
+      DRY_RUN: ${{ inputs.dry_run == true && 'true' || 'false' }}
+    steps:
+      - name: Merge upstream into the default branch and open PR branches
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import tempfile
+          from urllib.parse import quote, urlencode
+          from urllib.request import Request, urlopen
+
+
+          def api(path):
+              request = Request(
+                  "https://api.github.com/" + path,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                      "User-Agent": "safe-fork-upstream-sync",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              with urlopen(request, timeout=60) as response:
+                  return json.load(response)
+
+
+          def summary(message):
+              print(message, flush=True)
+              if os.environ.get("GITHUB_STEP_SUMMARY"):
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+                      output.write(message + "\n\n")
+
+
+          def sync(directory, origin, upstream, targets, dry_run):
+              def git(*arguments, check=True):
+                  result = subprocess.run(
+                      ["git", "-C", str(directory), *arguments],
+                      text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                  )
+                  if check and result.returncode:
+                      raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+                  return result
+
+              git("init", "--quiet")
+              git("config", "user.name", "github-actions[bot]")
+              git("config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
+              git("config", "core.hooksPath", "/dev/null")
+              git("config", "commit.gpgsign", "false")
+              git("remote", "add", "origin", origin)
+              git("remote", "add", "upstream", upstream)
+              for branch in targets:
+                  git("check-ref-format", "refs/heads/" + branch)
+              for base in set(target["base"] for target in targets.values()):
+                  git("check-ref-format", "refs/heads/" + base)
+              git("fetch", "--no-tags", "origin", *[
+                  "refs/heads/" + branch + ":refs/remotes/origin/" + branch
+                  for branch in targets
+              ])
+              git("fetch", "--no-tags", "upstream", *[
+                  "refs/heads/" + base + ":refs/remotes/upstream/" + base
+                  for base in sorted(set(target["base"] for target in targets.values()))
+              ])
+              updates = []
+              # Prepare EVERY merge before pushing anything. A conflict leaves all
+              # remote branches untouched, including already prepared branches.
+              for branch, target in targets.items():
+                  original = git("rev-parse", "refs/remotes/origin/" + branch).stdout.strip()
+                  if original != target["sha"]:
+                      raise RuntimeError("Branch changed during discovery: " + branch)
+                  git("checkout", "--quiet", "--detach", original)
+                  merged = git(
+                      "merge", "--no-edit", "--no-gpg-sign",
+                      "refs/remotes/upstream/" + target["base"], check=False,
+                  )
+                  if merged.returncode:
+                      conflicts = git("diff", "--name-only", "--diff-filter=U").stdout.strip()
+                      git("merge", "--abort", check=False)
+                      summary("Stopped without pushing: merge failed for `" + branch + "`.")
+                      if conflicts:
+                          summary("Conflicting files:\n```text\n" + conflicts + "\n```")
+                      raise RuntimeError("Resolve this branch manually before the next sync. " + merged.stderr.strip())
+                  prepared = git("rev-parse", "HEAD").stdout.strip()
+                  if prepared != original:
+                      updates.append(prepared + ":refs/heads/" + branch)
+                      summary("Prepared upstream merge for `" + branch + "`.")
+                  else:
+                      summary("Already up to date: `" + branch + "`.")
+              if not updates:
+                  return
+              if dry_run:
+                  summary("Dry run succeeded; no branches were pushed.")
+                  return
+              # Plain fast-forward-only push, all refs in one atomic transaction.
+              # Concurrent incompatible pushes cause rejection, never a force push.
+              git("push", "--atomic", "origin", *updates)
+              summary("Updated " + str(len(updates)) + " branch(es) atomically.")
+
+
+          def main():
+              fork = os.environ["FORK_REPOSITORY"]
+              upstream = os.environ["UPSTREAM_REPOSITORY"]
+              repository = api("repos/" + fork)
+              if not repository.get("fork") or repository.get("parent", {}).get("full_name") != upstream:
+                  raise RuntimeError("Unexpected fork/upstream relationship; refusing to sync.")
+              default = repository["default_branch"]
+              if default != os.environ["EXPECTED_DEFAULT_BRANCH"]:
+                  raise RuntimeError("Default branch changed; review the workflow configuration.")
+              parent = api("repos/" + upstream)
+              branch = api("repos/" + fork + "/branches/" + quote(default, safe=""))
+              targets = {default: {"sha": branch["commit"]["sha"], "base": parent["default_branch"]}}
+              owner = repository["owner"]["login"]
+              # Search only the owner's open contributions; validate each result's
+              # actual head repository before allowing writes to any branch.
+              page = 1
+              while True:
+                  query = urlencode({
+                      "q": "repo:" + upstream + " is:pr is:open author:" + owner,
+                      "per_page": 100, "page": page,
+                  })
+                  results = api("search/issues?" + query)
+                  if results.get("incomplete_results") or results["total_count"] > 1000:
+                      raise RuntimeError("Incomplete PR discovery; refusing a partial sync.")
+                  for issue in results["items"]:
+                      pr = api("repos/" + upstream + "/pulls/" + str(issue["number"]))
+                      if pr["state"] != "open" or pr.get("merged"):
+                          continue
+                      if (pr["head"].get("repo") or {}).get("full_name") != fork:
+                          continue
+                      if pr["base"]["repo"]["full_name"] != upstream:
+                          raise RuntimeError("Unexpected PR target repository.")
+                      head = pr["head"]["ref"]
+                      target = {"sha": pr["head"]["sha"], "base": pr["base"]["ref"]}
+                      if head in targets and targets[head] != target:
+                          raise RuntimeError("Conflicting base branches for " + head)
+                      targets[head] = target
+                  if page * 100 >= results["total_count"]:
+                      break
+                  page += 1
+              summary("Syncing `" + fork + "` from `" + upstream + "`.")
+              credential = base64.b64encode(("x-access-token:" + os.environ["GH_TOKEN"]).encode()).decode()
+              # Keep credentials out of URLs, command arguments and the checkout.
+              os.environ.update({
+                  "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1",
+                  "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+                  "GIT_CONFIG_VALUE_0": "AUTHORIZATION: basic " + credential,
+              })
+              with tempfile.TemporaryDirectory(prefix="fork-upstream-sync-") as directory:
+                  sync(
+                      Path(directory), "https://github.com/" + fork + ".git",
+                      "https://github.com/" + upstream + ".git", targets,
+                      os.environ.get("DRY_RUN") == "true",
+                  )
+
+
+          if __name__ == "__main__":
+              main()
+          PY
