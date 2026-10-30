@@ -11,7 +11,7 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: fork-upstream-sync
@@ -24,6 +24,7 @@ jobs:
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
+      FORK_SYNC_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
       FORK_REPOSITORY: ${{ github.repository }}
       UPSTREAM_REPOSITORY: paperclipai/paperclip
       EXPECTED_DEFAULT_BRANCH: master
@@ -123,6 +124,12 @@ jobs:
               if dry_run:
                   summary("Dry run succeeded; no branches were pushed.")
                   return
+              if not os.environ.get("FORK_SYNC_TOKEN"):
+                  raise RuntimeError(
+                      "Configure the FORK_SYNC_TOKEN Actions secret with a fine-grained "
+                      "token restricted to this fork, with Contents and Workflows read/write "
+                      "permissions. GITHUB_TOKEN cannot push upstream workflow-file changes."
+                  )
               # Plain fast-forward-only push, all refs in one atomic transaction.
               # Concurrent incompatible pushes cause rejection, never a force push.
               git("push", "--atomic", "origin", *updates)
@@ -170,7 +177,7 @@ jobs:
                       break
                   page += 1
               summary("Syncing `" + fork + "` from `" + upstream + "`.")
-              credential = base64.b64encode(("x-access-token:" + os.environ["GH_TOKEN"]).encode()).decode()
+              credential = base64.b64encode(("x-access-token:" + (os.environ.get("FORK_SYNC_TOKEN") or os.environ["GH_TOKEN"])).encode()).decode()
               # Keep credentials out of URLs, command arguments and the checkout.
               os.environ.update({
                   "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1",
